@@ -1,318 +1,363 @@
+"""
+ATM Simulator
+=============
+
+A simple command-line ATM simulator. Supports PIN authentication,
+balance checks, deposits, withdrawals, and a transaction history --
+with a few realistic touches:
+
+- Money is handled using Decimal, not float, so amounts are never
+  corrupted by binary floating-point rounding errors.
+- Withdrawals are checked against a per-transaction limit, a daily
+  limit, a simple fraud heuristic (too many withdrawals, or too much
+  money moved, in a short time), and a "free transactions per
+  session, then a flat fee" model loosely based on how Indian banks
+  charge for ATM use beyond the RBI's free-transaction limit.
+- The PIN is stored as a plain string and compared directly. A real
+  banking system would hash the PIN and use a constant-time
+  comparison instead -- that's intentionally out of scope here.
+
+Nothing is saved to disk: the balance and transaction history reset
+every time you run the program.
+
+Run it with:  python atm_simulator.py
+"""
+
 import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-class SecureBankATM:
-    """
-    A production-grade Virtual ATM state machine.
-    
-    Architectural Enhancements Implemented:
-    - High-precision base-10 arithmetic utilizing the decimal.Decimal standard.
-    - Offset-aware UTC transaction logging formatted to ISO 8601 (RFC 3339).
-    - Regulatory enforcement of RBI transaction limits, hardware caps, and fee structures.
-    - Dynamic velocity and volume fraud detection mechanisms utilizing time deltas.
-    - Secure credential handling utilizing string primitives to preserve absolute entropy.
-    """
 
-    def __init__(self, account_holder: str, balance: str = "2500.00", pin: str = "1234"):
-        # 1. State Management & Cryptographic Setup
+class ATMSimulator:
+    """One ATM session for one account."""
+
+    # ---- Shared settings (same for every ATM, so they live on the
+    # class itself instead of being rebuilt inside __init__ each time) ----
+
+    MAX_PIN_ATTEMPTS = 3                    # wrong PINs allowed before locking
+
+    PER_TXN_LIMIT = Decimal("25000.00")     # max withdrawal in one go
+    DAILY_LIMIT = Decimal("100000.00")      # max withdrawal per day
+    MAX_DEPOSIT = Decimal("100000.00")      # max deposit in one go
+    # (Real banks set their own per-transaction/daily limits per card
+    # type -- there isn't one single RBI-wide number for this. These
+    # are just realistic example values for the simulation.)
+
+    FREE_TXN_LIMIT = 5                      # free withdrawals before a fee applies
+    EXCESS_TXN_FEE = Decimal("23.00")       # RBI's current cap on that fee
+
+    FRAUD_TIME_WINDOW_SEC = 300             # 5-minute rolling window
+    VELOCITY_MAX_COUNT = 3                  # max withdrawals allowed in that window
+    VOLUME_MAX_LIMIT = Decimal("50000.00")  # max amount withdrawn in that window
+
+    TWO_PLACES = Decimal("0.01")            # used to round money to 2 decimal places
+
+    def __init__(self, account_holder, balance="2500.00", pin="1234"):
         self.account_holder = account_holder
-        
-        # Financial values MUST be instantiated as Decimal via string literals.
-        # This immunizes the ledger against IEEE 754 binary floating-point approximation.
-        self.balance = Decimal(balance)
-        
-        # Credentials must remain strings to preserve leading zeroes (e.g., "0912" != 912)
-        self.pin = pin
-        
-        # Immutable security state variables
-        self.is_locked = False
-        self.MAX_PIN_ATTEMPTS = 3
-        self.pin_attempts_remaining = self.MAX_PIN_ATTEMPTS
-        
-        # Structured immutable ledger for chronological auditing
-        self.transaction_history = []
-        
-        # 2. RBI Regulatory & Hardware Constraints
-        # Based on standard mass-market card variants (e.g., RuPay Classic / VISA Classic)
-        self.PER_TXN_LIMIT = Decimal("25000.00")      # Hardware extraction limit per request
-        self.DAILY_LIMIT = Decimal("100000.00")       # Total daily limit across all sessions
-        self.daily_withdrawn = Decimal("0.00")        # Volatile accumulator for current session
-        
-        self.FREE_TXN_LIMIT = 5                       # RBI mandated free transactions (On-Us Network)
-        self.txns_performed = 0                       # Counter for billable ledger events
-        self.EXCESS_TXN_FEE = Decimal("23.00")        # Current RBI mandated fee beyond free tier
-        
-        # 3. Fraud Detection Constants (Velocity & Volume Heuristics)
-        self.FRAUD_TIME_WINDOW_SEC = 300              # 5-minute rolling temporal window
-        self.VELOCITY_MAX_COUNT = 3                   # Hard limit: 3 withdrawals in 5 mins
-        self.VOLUME_MAX_LIMIT = Decimal("50000.00")   # Hard limit: ₹50k outflow in 5 mins
 
-    def authenticate(self, input_pin: str) -> bool:
-        """
-        Cryptographically evaluates the provided PIN against the stored credential.
-        Permanently locks the instance in memory if exhaustive attempts are reached.
-        """
-        # Reject authentication instantly if the system state is flagged as compromised
+        # Always build Decimal amounts from strings, never from floats,
+        # and round to exactly 2 decimal places so the balance can
+        # never quietly drift to 3+ decimal places.
+        self.balance = Decimal(balance).quantize(self.TWO_PLACES, rounding=ROUND_HALF_UP)
+
+        # Kept as a string, not an int, so a PIN like "0912" doesn't
+        # lose its leading zero.
+        self.pin = pin
+
+        self.is_locked = False
+        self.pin_attempts_remaining = self.MAX_PIN_ATTEMPTS
+
+        self.daily_withdrawn = Decimal("0.00")
+        self.txns_performed = 0
+
+        # Every deposit, withdrawal, and failed attempt gets appended
+        # here so print_statement() can show the full session history.
+        self.transaction_history = []
+
+    # ------------------------------------------------------------------
+    # Public operations
+    # ------------------------------------------------------------------
+
+    def authenticate(self, input_pin):
+        """Check a PIN against the stored one. Locks the account after
+        too many wrong attempts in a row."""
         if self.is_locked:
-            print("\n[SECURITY FAULT] Account is locked due to suspicious activity or failed authorizations.")
+            print("\n[LOCKED] This account is locked. Please contact your bank.")
             return False
-            
-        # In a deployed environment, this comparison must utilize constant-time algorithms
-        # such as hmac.compare_digest() to mitigate timing-based side-channel attacks.
+
+        # Note: a real system would never compare PINs directly like
+        # this. It would store a hash of the PIN and compare using
+        # something like hmac.compare_digest() to avoid leaking timing
+        # information. Doing that properly is outside the scope of a
+        # simulator like this one.
         if input_pin == self.pin:
-            self.pin_attempts_remaining = self.MAX_PIN_ATTEMPTS # Restoring state upon success
+            self.pin_attempts_remaining = self.MAX_PIN_ATTEMPTS
             return True
+
+        self.pin_attempts_remaining -= 1
+        if self.pin_attempts_remaining <= 0:
+            self.is_locked = True
+            print("\n[LOCKED] Too many incorrect attempts. Account locked.")
         else:
-            self.pin_attempts_remaining -= 1
-            if self.pin_attempts_remaining <= 0:
-                self.is_locked = True
-                print("\n[LOCKED] Maximum PIN entropy exhausted. Account has been permanently locked.")
-            else:
-                print(f"\n[DENIED] Incorrect credential. Authorization attempts remaining: {self.pin_attempts_remaining}")
-            return False
+            print(f"\n[DENIED] Incorrect PIN. Attempts remaining: {self.pin_attempts_remaining}")
+        return False
 
     def check_balance(self):
-        """
-        Generates a standardized view of available liquidity.
-        Note: Under specific RBI frameworks, non-financial queries may deplete the free tier quota.
-        For this standard simulation, balance checks are exempt from fee routing.
-        """
-        print(f"\n-------------------------------------------------------")
-        print(f" Account Holder: {self.account_holder}")
-        # Dynamically formats the Decimal object with comma separations and exact dual precision
-        print(f" Cleared Balance: ₹{self.balance:,.2f}")
-        print(f"-------------------------------------------------------")
+        """Print the current balance.
 
-    def _assess_transaction_fee(self) -> Decimal:
+        This works even if the account is locked -- in real life you
+        can usually still see your balance (net banking, SMS) even with
+        a blocked card, so that's intentional here, not an oversight.
         """
-        Evaluates the transaction counter against RBI compliance quotas.
-        Returns the predetermined penalty fee (₹23.00) if the free tier is breached.
+        print("\n-------------------------------------------------------")
+        print(f" Account Holder : {self.account_holder}")
+        print(f" Balance        : Rs. {self.balance:,.2f}")
+        print("-------------------------------------------------------")
+
+    def deposit(self, amount_str):
+        """Add money to the balance."""
+        if self.is_locked:
+            print("\n[DENIED] This account is locked.")
+            return
+
+        amount = self._parse_amount(amount_str)
+        if amount is None:
+            print("\n[ERROR] Please enter a valid amount, e.g. 500 or 500.50")
+            return
+
+        if amount <= Decimal("0.00"):
+            print("\n[ERROR] Deposit amount must be greater than zero.")
+            return
+
+        if amount > self.MAX_DEPOSIT:
+            print(f"\n[DENIED] Amount exceeds the maximum single deposit of Rs. {self.MAX_DEPOSIT:,.2f}.")
+            return
+
+        self.balance += amount
+        self._log_transaction("DEPOSIT", amount, "SUCCESS", Decimal("0.00"))
+
+        print(f"\n[SUCCESS] Deposited Rs. {amount:,.2f}.")
+        print(f"New balance: Rs. {self.balance:,.2f}")
+
+    def withdraw(self, amount_str):
         """
+        Withdraw money. Checks, in order:
+          1. the per-transaction limit
+          2. the daily limit
+          3. a simple fraud heuristic
+          4. whether the balance covers the amount plus any fee
+        Only if all four pass does the balance actually change.
+        """
+        if self.is_locked:
+            print("\n[DENIED] This account is locked.")
+            return
+
+        amount = self._parse_amount(amount_str)
+        if amount is None:
+            print("\n[ERROR] Please enter a valid amount, e.g. 500 or 500.50")
+            return
+
+        if amount <= Decimal("0.00"):
+            print("\n[ERROR] Withdrawal amount must be greater than zero.")
+            return
+
+        if amount > self.PER_TXN_LIMIT:
+            print(f"\n[DENIED] Amount exceeds the per-transaction limit of Rs. {self.PER_TXN_LIMIT:,.2f}.")
+            self._log_transaction("WITHDRAWAL", amount, "FAILED_TXN_LIMIT", Decimal("0.00"))
+            return
+
+        if self.daily_withdrawn + amount > self.DAILY_LIMIT:
+            print(f"\n[DENIED] This would exceed today's withdrawal limit of Rs. {self.DAILY_LIMIT:,.2f}.")
+            self._log_transaction("WITHDRAWAL", amount, "FAILED_DAILY_LIMIT", Decimal("0.00"))
+            return
+
+        if self._detect_fraud(amount):
+            print("\n[ACCOUNT LOCKED] Unusual withdrawal activity detected.")
+            return
+
+        # _quote_fee() only calculates -- it doesn't change any state --
+        # so there's nothing to undo if the balance check below fails.
+        fee = self._quote_fee()
+        total_needed = amount + fee
+
+        if total_needed > self.balance:
+            print(f"\n[DENIED] Insufficient balance. Current balance: Rs. {self.balance:,.2f}")
+            if fee > Decimal("0.00"):
+                print(f"          (This withdrawal would also include a Rs. {fee:,.2f} fee.)")
+            self._log_transaction("WITHDRAWAL", amount, "FAILED_INSUFFICIENT_FUNDS", Decimal("0.00"))
+            return
+
+        # Everything checks out -- commit all the state changes together.
         self.txns_performed += 1
-        if self.txns_performed > self.FREE_TXN_LIMIT:
+        self.balance -= total_needed
+        self.daily_withdrawn += amount
+        self._log_transaction("WITHDRAWAL", amount, "SUCCESS", fee)
+
+        print(f"\n[SUCCESS] Withdrew Rs. {amount:,.2f}.")
+        if fee > Decimal("0.00"):
+            print(f"          A Rs. {fee:,.2f} fee applied (free transactions used up).")
+        print(f"New balance: Rs. {self.balance:,.2f}")
+
+    def print_statement(self):
+        """Print every transaction from this session, oldest first."""
+        print("\n=======================================================")
+        print("                 TRANSACTION STATEMENT")
+        print("=======================================================")
+
+        if not self.transaction_history:
+            print(" No transactions yet.")
+            return
+
+        for i, tx in enumerate(self.transaction_history, start=1):
+            ts = tx["timestamp"].strftime("%Y-%m-%d %H:%M:%S UTC")
+            print(f"{i}. [{ts}] {tx['type']}")
+            print(f"   Amount        : Rs. {tx['amount']:,.2f}")
+            if tx["fee"] > Decimal("0.00"):
+                print(f"   Fee           : Rs. {tx['fee']:,.2f}")
+            print(f"   Status        : {tx['status']}")
+            print(f"   Balance after : Rs. {tx['balance_after']:,.2f}")
+            print("-------------------------------------------------------")
+
+    # ------------------------------------------------------------------
+    # Internal helpers (leading underscore = not meant to be called
+    # from outside the class)
+    # ------------------------------------------------------------------
+
+    def _parse_amount(self, amount_str):
+        """
+        Turn user input into a valid Decimal amount rounded to 2 decimal
+        places, or return None if it isn't valid.
+
+        This guards against two easy-to-miss edge cases:
+        - Decimal("nan") and Decimal("Infinity") both parse without
+          error (they're valid Decimal values!) but aren't valid money
+          amounts. Comparing a NaN with <, <=, > or >= raises an error,
+          so it has to be caught here, before any comparison happens.
+        - Without rounding here, an amount like "10.999" would carry
+          three decimal places into the balance forever, even though
+          everything is displayed rounded to two -- so the number on
+          screen and the number actually stored would quietly disagree.
+        """
+        try:
+            amount = Decimal(amount_str)
+        except InvalidOperation:
+            return None
+
+        if not amount.is_finite():
+            return None
+
+        return amount.quantize(self.TWO_PLACES, rounding=ROUND_HALF_UP)
+
+    def _quote_fee(self):
+        """Return the fee that would apply to the NEXT withdrawal. Pure
+        calculation -- doesn't change any state, so it's safe to call
+        just to check."""
+        if self.txns_performed >= self.FREE_TXN_LIMIT:
             return self.EXCESS_TXN_FEE
         return Decimal("0.00")
 
-    def _detect_fraud(self, requested_amount: Decimal) -> bool:
+    def _detect_fraud(self, requested_amount):
         """
-        Executes heuristic analysis over the transaction ledger to detect velocity and volume anomalies.
-        Returns True and engages the security lockdown if a threat vector is identified.
+        A very simple fraud heuristic: look at successful withdrawals in
+        the last few minutes and lock the account if either the number
+        of withdrawals or the total amount withdrawn looks unusually
+        high. Real fraud detection is far more sophisticated than this --
+        this is just meant to demonstrate the idea.
         """
-        # Generate an offset-aware UTC datetime to ensure perfect cross-regional compatibility
-        current_time = datetime.datetime.now(datetime.timezone.utc)
-        
-        # Filter the ledger to isolate successful withdrawals within the rolling time window
+        now = datetime.datetime.now(datetime.timezone.utc)
+
         recent_withdrawals = [
             tx for tx in self.transaction_history
-            if tx['type'] == 'WITHDRAWAL' and tx['status'] == 'SUCCESS'
-            and (current_time - tx['timestamp']).total_seconds() <= self.FRAUD_TIME_WINDOW_SEC
+            if tx["type"] == "WITHDRAWAL"
+            and tx["status"] == "SUCCESS"
+            and (now - tx["timestamp"]).total_seconds() <= self.FRAUD_TIME_WINDOW_SEC
         ]
-        
-        # Threat Vector 1: Velocity Check (Excessive rapid extraction attempts)
+
+        # Too many withdrawals in a short time
         if len(recent_withdrawals) >= self.VELOCITY_MAX_COUNT:
             self.is_locked = True
             self._log_transaction("FRAUD_LOCK_VELOCITY", requested_amount, "BLOCKED", Decimal("0.00"))
             return True
-            
-        # Threat Vector 2: Volume Check (Massive capital flight within microscopic window)
-        cumulative_recent = sum(tx['amount'] for tx in recent_withdrawals)
-        if cumulative_recent + requested_amount > self.VOLUME_MAX_LIMIT:
+
+        # Too much money moved in a short time
+        recent_total = sum(tx["amount"] for tx in recent_withdrawals)
+        if recent_total + requested_amount > self.VOLUME_MAX_LIMIT:
             self.is_locked = True
             self._log_transaction("FRAUD_LOCK_VOLUME", requested_amount, "BLOCKED", Decimal("0.00"))
             return True
-            
+
         return False
 
-    def _log_transaction(self, tx_type: str, amount: Decimal, status: str, fee: Decimal):
-        """
-        Constructs and appends an immutable, timezone-aware dictionary to the session ledger.
-        """
+    def _log_transaction(self, tx_type, amount, status, fee):
+        """Append one entry to the transaction history."""
         self.transaction_history.append({
             "timestamp": datetime.datetime.now(datetime.timezone.utc),
             "type": tx_type,
             "amount": amount,
             "fee": fee,
             "status": status,
-            "balance_after": self.balance
+            "balance_after": self.balance,
         })
 
-    def deposit(self, amount_str: str):
-        """
-        Validates input sanitization and processes capital injection safely.
-        """
-        if self.is_locked:
-            print("\n[DENIED] Transaction rejected. Account is under security lockdown.")
-            return
 
-        try:
-            # Traps any alphanumeric pollution and casts cleanly to Decimal
-            amount = Decimal(amount_str)
-        except InvalidOperation:
-            print("\n[ERROR] Malformed input detected. Please utilize numerical syntax exclusively.")
-            return
+def main():
+    atm = ATMSimulator(account_holder="Demo User", balance="2500.00", pin="1234")
 
-        if amount <= Decimal("0.00"):
-            print("\n[ERROR] Deposited capital must represent a positive integer.")
-            return
-
-        # Simulating physical cassette capacity limits (e.g., 200 physical notes of ₹500)
-        MAX_DEPOSIT = Decimal("100000.00")
-        if amount > MAX_DEPOSIT:
-            print(f"\n[DENIED] Volume exceeds physical intake manifold capacity of ₹{MAX_DEPOSIT:,.2f}.")
-            return
-
-        # Execute verified mathematical addition
-        self.balance += amount
-        self._log_transaction("DEPOSIT", amount, "SUCCESS", Decimal("0.00"))
-        
-        print(f"\n[SUCCESS] Capital ingestion confirmed: ₹{amount:,.2f}.")
-        print(f"Updated Ledger Balance: ₹{self.balance:,.2f}")
-
-    def withdraw(self, amount_str: str):
-        """
-        Processes capital extraction by orchestrating RBI limits, penalty fee structures, 
-        and dynamic heuristic threat monitoring.
-        """
-        if self.is_locked:
-            print("\n[DENIED] Transaction rejected. Account is under security lockdown.")
-            return
-
-        try:
-            amount = Decimal(amount_str)
-        except InvalidOperation:
-            print("\n[ERROR] Malformed input detected. Please utilize numerical syntax exclusively.")
-            return
-
-        if amount <= Decimal("0.00"):
-            print("\n[ERROR] Withdrawal request must represent a positive integer.")
-            return
-
-        # 1. Hardware & Risk Analysis: Per-Transaction Limit verification
-        if amount > self.PER_TXN_LIMIT:
-            print(f"\n[DENIED] Hardware constraint exceeded. RBI per-transaction cap is ₹{self.PER_TXN_LIMIT:,.2f}.")
-            self._log_transaction("WITHDRAWAL", amount, "FAILED_HARDWARE_LIMIT", Decimal("0.00"))
-            return
-
-        # 2. Regulatory Compliance: Cumulative Daily Ceiling verification
-        if self.daily_withdrawn + amount > self.DAILY_LIMIT:
-            print(f"\n[DENIED] Request exceeds regulatory daily dispensation limit of ₹{self.DAILY_LIMIT:,.2f}.")
-            self._log_transaction("WITHDRAWAL", amount, "FAILED_DAILY_LIMIT", Decimal("0.00"))
-            return
-
-        # 3. Security Check: Dynamic Threat Vector Detection
-        if self._detect_fraud(amount):
-            print("\n[CRITICAL SECURITY ALERT] Anomalous behavioural vectors detected. Account locked.")
-            return
-
-        # 4. Interchange Protocol: Assess fees and ensure adequate liquidity exists for combined liability
-        applicable_fee = self._assess_transaction_fee()
-        total_liability = amount + applicable_fee
-
-        if total_liability > self.balance:
-            print(f"\n[DENIED] Insufficient liquidity. Current Balance: ₹{self.balance:,.2f}")
-            if applicable_fee > 0:
-                print(f"         (Note: An interchange penalty fee of ₹{applicable_fee:,.2f} applies to this request).")
-            # The transaction failed, thus the usage counter must be rolled back
-            self.txns_performed -= 1
-            self._log_transaction("WITHDRAWAL", amount, "FAILED_INSUFFICIENT_FUNDS", Decimal("0.00"))
-            return
-
-        # 5. Authorization: Execute ledger modifications
-        self.balance -= total_liability
-        self.daily_withdrawn += amount
-        
-        # Append finalized state to immutable ledger
-        self._log_transaction("WITHDRAWAL", amount, "SUCCESS", applicable_fee)
-
-        print(f"\n[SUCCESS] Extraction authorized. Dispensing ₹{amount:,.2f}.")
-        if applicable_fee > Decimal("0.00"):
-            print(f"          (Interchange network fee of ₹{applicable_fee:,.2f} applied due to quota exhaustion).")
-        print(f"Updated Ledger Balance: ₹{self.balance:,.2f}")
-
-    def print_statement(self):
-        """
-        Renders a chronologically ordered, ISO 8601 (RFC 3339) compliant audit log 
-        suitable for regulatory transmission or end-user review.
-        """
-        print(f"\n=======================================================")
-        print(f"       SECURE CRYPTOGRAPHIC AUDIT LOG & LEDGER         ")
-        print(f"=======================================================")
-        if not self.transaction_history:
-            print(" No chronological events recorded in the current session.")
-        else:
-            for index, tx in enumerate(self.transaction_history, start=1):
-                # Formats the aware UTC datetime into a universally standardized Zulu string
-                ts = tx['timestamp'].strftime('%Y-%m-%dT%H:%M:%SZ')
-                
-                print(f"{index}. [{ts}] {tx['type']}")
-                print(f"   Requested Volume: ₹{tx['amount']:,.2f}")
-                if tx['fee'] > Decimal("0.00"):
-                    print(f"   Interchange Fee : ₹{tx['fee']:,.2f}")
-                print(f"   Final Status    : {tx['status']}")
-                print(f"   Ledger Residual : ₹{tx['balance_after']:,.2f}")
-                print(f"-------------------------------------------------------")
-
-
-def execute_virtual_atm_terminal():
-    """
-    Primary interactive execution daemon.
-    Utilizes broad exception trapping to guarantee zero runtime architectural collapses.
-    """
-    # System Initialization
-    atm = SecureBankATM(account_holder="Authorized Client", balance="2500.00", pin="1234")
-
-    print("\n=======================================================")
-    print("      SECURE VIRTUAL ATM TERMINAL (RBI COMPLIANT)      ")
     print("=======================================================")
+    print("                    ATM SIMULATOR")
+    print("=======================================================")
+    print("(Demo PIN is 1234 -- this is a simulation, not a real bank)")
 
-    # Phase 1: Identity & Access Management
+    # ---- Step 1: authenticate before showing the menu ----
     authenticated = False
     while atm.pin_attempts_remaining > 0 and not atm.is_locked:
-        entered_pin = input("\nTransmit 4-digit Cryptographic PIN: ").strip()
+        entered_pin = input("\nEnter your 4-digit PIN: ").strip()
         if atm.authenticate(entered_pin):
             authenticated = True
-            print("\n[AUTHENTICATION SUCCESS] Encrypted session established.")
+            print("\n[SUCCESS] PIN accepted.")
             break
 
     if not authenticated:
-        # Graceful daemon termination upon security lockout
+        print("\nToo many incorrect attempts. Exiting.")
         return
 
-    # Phase 2: Core Routing Matrix
+    # ---- Step 2: main menu loop ----
     while True:
-        print("\n=======================================================")
-        print("                 TERMINAL ROUTING MATRIX               ")
-        print("=======================================================")
-        print(" 1. Query Liquidity (Balance Check)")
-        print(" 2. Execute Capital Injection (Deposit)")
-        print(" 3. Execute Capital Extraction (Withdrawal)")
-        print(" 4. Generate Cryptographic Audit Trail")
-        print(" 5. Terminate Session & Eject Media")
-        print("=======================================================")
-
-        command_vector = input("Transmit routing parameter (1-5): ").strip()
-
-        if command_vector == "1":
-            atm.check_balance()
-
-        elif command_vector == "2":
-            deposit_volume = input("Declare injection volume (₹): ").strip()
-            atm.deposit(deposit_volume)
-
-        elif command_vector == "3":
-            withdraw_volume = input("Declare extraction volume (₹): ").strip()
-            atm.withdraw(withdraw_volume)
-
-        elif command_vector == "4":
-            atm.print_statement()
-
-        elif command_vector == "5":
-            print("\n[SESSION TERMINATED] Destroying tokens. Media ejected. Goodbye.")
+        # Checked at the top of every loop, not just right after a
+        # withdrawal, so a mid-session fraud lock ends the session the
+        # same way a failed-PIN lock does.
+        if atm.is_locked:
+            print("\n[SESSION ENDED] Your account is locked. Please contact your bank.")
             break
 
-        else:
-            print("\n[ROUTING ERROR] Unrecognized parameter. Valid matrix range is 1 through 5.")
+        print("\n=======================================================")
+        print(" 1. Check Balance")
+        print(" 2. Deposit")
+        print(" 3. Withdraw")
+        print(" 4. Print Statement")
+        print(" 5. Exit")
+        print("=======================================================")
 
-# Execution entry point
+        choice = input("Choose an option (1-5): ").strip()
+
+        if choice == "1":
+            atm.check_balance()
+        elif choice == "2":
+            amount_str = input("Enter deposit amount (Rs.): ").strip()
+            atm.deposit(amount_str)
+        elif choice == "3":
+            amount_str = input("Enter withdrawal amount (Rs.): ").strip()
+            atm.withdraw(amount_str)
+        elif choice == "4":
+            atm.print_statement()
+        elif choice == "5":
+            print("\nThank you for using the ATM. Goodbye!")
+            break
+        else:
+            print("\n[ERROR] Please choose a number from 1 to 5.")
+
+
 if __name__ == "__main__":
-    execute_virtual_atm_terminal()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nSession interrupted. Goodbye!")
