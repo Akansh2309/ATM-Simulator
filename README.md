@@ -1,3 +1,5 @@
+[![Python application](https://github.com/Akansh2309/ATM-Simulator/actions/workflows/python-app.yml/badge.svg)](https://github.com/Akansh2309/ATM-Simulator/actions/workflows/python-app.yml)
+
 <div align="center">
 <h1>ATM Simulator</h1>
 <p>
